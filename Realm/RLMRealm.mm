@@ -42,6 +42,7 @@
 #include "schema.hpp"
 #include "shared_realm.hpp"
 #include "thread_safe_reference.hpp"
+#include "util/scheduler.hpp"
 
 #include <realm/disable_sync_to_disk.hpp>
 #include <realm/util/scope_exit.hpp>
@@ -199,6 +200,10 @@ NSData *RLMRealmValidatedEncryptionKey(NSData *key) {
 
 + (instancetype)defaultRealm {
     return [RLMRealm realmWithConfiguration:[RLMRealmConfiguration rawDefaultConfiguration] error:nil];
+}
+
++ (instancetype)defaultRealmForQueue:(dispatch_queue_t)queue {
+    return [RLMRealm realmWithConfiguration:[RLMRealmConfiguration rawDefaultConfiguration] queue:queue error:nil];
 }
 
 + (instancetype)realmWithURL:(NSURL *)fileURL {
@@ -415,16 +420,23 @@ REALM_NOINLINE static void translateSharedGroupOpenException(NSError **error) {
 
 
 + (instancetype)realmWithConfiguration:(RLMRealmConfiguration *)configuration error:(NSError **)error {
+    return [self realmWithConfiguration:configuration queue:nil error:error];
+}
+
++ (instancetype)realmWithConfiguration:(RLMRealmConfiguration *)configuration
+                                 queue:(dispatch_queue_t)queue
+                                 error:(NSError **)error {
     bool dynamic = configuration.dynamic;
     bool cache = configuration.cache;
     bool readOnly = configuration.readOnly;
+    void *cacheKey = queue ? (__bridge void *)queue : pthread_self();
 
     {
         Realm::Config& config = configuration.config;
 
         // try to reuse existing realm first
         if (cache || dynamic) {
-            if (RLMRealm *realm = RLMGetThreadLocalCachedRealmForPath(config.path)) {
+            if (RLMRealm *realm = RLMGetThreadLocalCachedRealmForPath(config.path, cacheKey)) {
                 auto const& old_config = realm->_realm->config();
                 if (old_config.immutable() != config.immutable()
                     || old_config.read_only_alternative() != config.read_only_alternative()) {
@@ -446,6 +458,9 @@ REALM_NOINLINE static void translateSharedGroupOpenException(NSError **error) {
 
     configuration = [configuration copy];
     Realm::Config& config = configuration.config;
+    if (queue) {
+        config.scheduler = realm::util::Scheduler::make_dispatch((__bridge void *)queue);
+    }
 
     RLMRealm *realm = [[self alloc] initPrivate];
     realm->_dynamic = dynamic;
@@ -528,7 +543,7 @@ REALM_NOINLINE static void translateSharedGroupOpenException(NSError **error) {
     }
 
     if (cache) {
-        RLMCacheRealm(config.path, realm);
+        RLMCacheRealm(config.path, cacheKey, realm);
     }
 
     if (!readOnly) {
